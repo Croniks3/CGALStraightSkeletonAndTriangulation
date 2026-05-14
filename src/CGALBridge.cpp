@@ -9,6 +9,10 @@
 #include <CGAL/Triangulation_vertex_base_with_info_2.h>
 #include <CGAL/Constrained_triangulation_face_base_2.h>
 #include <CGAL/Triangulation_data_structure_2.h>
+#include <CGAL/Triangulation_face_base_with_info_2.h>
+
+#include <list>
+#include <vector>
 
 using Kernel = CGAL::Exact_predicates_inexact_constructions_kernel;
 using Point2 = Kernel::Point_2;
@@ -20,6 +24,103 @@ using Fb = CGAL::Constrained_triangulation_face_base_2<Kernel>;
 using Tds = CGAL::Triangulation_data_structure_2<Vb, Fb>;
 using Itag = CGAL::Exact_predicates_tag;
 using CDT = CGAL::Constrained_Delaunay_triangulation_2<Kernel, Tds, Itag>;
+
+struct FaceInfo2
+{
+    int nesting_level = -1;
+
+    bool in_domain() const
+    {
+        return nesting_level % 2 == 1;
+    }
+};
+
+using TriVb = CGAL::Triangulation_vertex_base_with_info_2<int, Kernel>;
+using TriFbb = CGAL::Triangulation_face_base_with_info_2<FaceInfo2, Kernel>;
+using TriFb = CGAL::Constrained_triangulation_face_base_2<Kernel, TriFbb>;
+using TriTds = CGAL::Triangulation_data_structure_2<TriVb, TriFb>;
+using TriCdt = CGAL::Constrained_Delaunay_triangulation_2<Kernel, TriTds, CGAL::Exact_predicates_tag>;
+
+namespace
+{
+    void MarkDomains(
+        TriCdt& cdt,
+        TriCdt::Face_handle start,
+        int index,
+        std::list<TriCdt::Edge>& border
+    )
+    {
+        if (start->info().nesting_level != -1)
+        {
+            return;
+        }
+
+        std::list<TriCdt::Face_handle> queue;
+        queue.push_back(start);
+
+        while (!queue.empty())
+        {
+            TriCdt::Face_handle face = queue.front();
+            queue.pop_front();
+
+            if (face->info().nesting_level != -1)
+            {
+                continue;
+            }
+
+            face->info().nesting_level = index;
+
+            for (int i = 0; i < 3; ++i)
+            {
+                TriCdt::Edge edge(face, i);
+                TriCdt::Face_handle neighbor = face->neighbor(i);
+
+                if (neighbor->info().nesting_level != -1)
+                {
+                    continue;
+                }
+
+                if (cdt.is_constrained(edge))
+                {
+                    border.push_back(edge);
+                }
+                else
+                {
+                    queue.push_back(neighbor);
+                }
+            }
+        }
+    }
+
+    void MarkDomains(TriCdt& cdt)
+    {
+        for (auto face = cdt.all_faces_begin(); face != cdt.all_faces_end(); ++face)
+        {
+            face->info().nesting_level = -1;
+        }
+
+        std::list<TriCdt::Edge> border;
+
+        MarkDomains(cdt, cdt.infinite_face(), 0, border);
+
+        while (!border.empty())
+        {
+            TriCdt::Edge edge = border.front();
+            border.pop_front();
+
+            TriCdt::Face_handle neighbor = edge.first->neighbor(edge.second);
+
+            if (neighbor->info().nesting_level == -1)
+            {
+                MarkDomains(
+                    cdt,
+                    neighbor,
+                    edge.first->info().nesting_level + 1,
+                    border);
+            }
+        }
+    }
+}
 
 namespace CGALBridge
 {
@@ -75,9 +176,11 @@ namespace CGALBridge
     int CGALBridge_BuildStraightSkeletonGraph(
         const Vec2* points,
         int count,
+        
         SkeletonVertex* outVertices,
         int maxVertices,
         int* outVertexCount,
+        
         SkeletonEdge* outEdges,
         int maxEdges,
         int* outEdgeCount
@@ -492,6 +595,97 @@ namespace CGALBridge
 
         *outTriangleCount = triangleIndex;
 
+        return 1;
+    }
+    
+    int CGALBridge_TriangulatePolygonWithHoles(
+        const Vec2* points, 
+        int pointCount, 
+        
+        const int* loopFirstIndices,
+        const int* loopVertexCounts, 
+        int loopCount,
+        
+        SkeletonTriangle* outTriangles, 
+        int maxTriangles,
+        int* outTriangleCount
+    )
+    {
+        if (!points ||
+            pointCount <= 0 ||
+            !loopFirstIndices ||
+            !loopVertexCounts ||
+            loopCount <= 0 ||
+            !outTriangles ||
+            maxTriangles <= 0 ||
+            !outTriangleCount)
+        {
+            return 0;
+        }
+        
+        *outTriangleCount = 0;
+        
+        TriCdt cdt;
+
+        for (int loopIndex = 0; loopIndex < loopCount; ++loopIndex)
+        {
+            const int firstIndex = loopFirstIndices[loopIndex];
+            const int vertexCount = loopVertexCounts[loopIndex];
+
+            if (firstIndex < 0 || vertexCount < 3 || firstIndex + vertexCount > pointCount)
+            {
+                return 0;
+            }
+
+            std::vector<TriCdt::Vertex_handle> handles;
+            handles.reserve(vertexCount);
+
+            for (int localIndex = 0; localIndex < vertexCount; ++localIndex)
+            {
+                const int pointIndex = firstIndex + localIndex;
+                const Vec2& p = points[pointIndex];
+
+                TriCdt::Vertex_handle handle = cdt.insert(Point2(p.x, p.y));
+                handle->info() = pointIndex;
+
+                handles.push_back(handle);
+            }
+
+            for (int localIndex = 0; localIndex < vertexCount; ++localIndex)
+            {
+                const int nextLocalIndex = (localIndex + 1) % vertexCount;
+
+                cdt.insert_constraint(
+                    handles[localIndex],
+                    handles[nextLocalIndex]
+                );
+            }
+        }
+        
+        MarkDomains(cdt);
+
+        int triangleCount = 0;
+
+        for (auto face = cdt.finite_faces_begin(); face != cdt.finite_faces_end(); ++face)
+        {
+            if (!face->info().in_domain())
+            {
+                continue;
+            }
+
+            if (triangleCount >= maxTriangles)
+            {
+                return 0;
+            }
+
+            outTriangles[triangleCount].a = face->vertex(0)->info();
+            outTriangles[triangleCount].b = face->vertex(1)->info();
+            outTriangles[triangleCount].c = face->vertex(2)->info();
+
+            ++triangleCount;
+        }
+
+        *outTriangleCount = triangleCount;
         return 1;
     }
 }

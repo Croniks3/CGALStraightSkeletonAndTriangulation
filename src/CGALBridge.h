@@ -93,5 +93,18 @@ namespace CGALBridge
             int maxTriangles,
             int* outTriangleCount
         );
+        
+        CGALBRIDGE_API int CGALBridge_TriangulatePolygonWithHoles(
+            const Vec2* points,
+            int pointCount,
+
+            const int* loopFirstIndices,
+            const int* loopVertexCounts,
+            int loopCount,
+
+            SkeletonTriangle* outTriangles,
+            int maxTriangles,
+            int* outTriangleCount
+        );
     }
 }
